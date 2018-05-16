@@ -13,12 +13,12 @@ import logging
 from django.conf import settings
 from django.contrib.contenttypes.models import ContentType
 from django.core.exceptions import ObjectDoesNotExist
-from django.db import models
+from django.db import connections, models, router
 from django.utils.encoding import force_text, python_2_unicode_compatible
 from django.utils.translation import ugettext as _
 
-from reversion.models import Version
-from reversion.revisions import _get_options
+from reversion.models import SubquerySQL, Version
+from reversion.revisions import _get_options, _get_content_type
 
 logger = logging.getLogger(__name__)
 
@@ -202,9 +202,44 @@ class CompareObject(object):
                 if ver.revision.date_created < old_revision.date_created
             }
 
-            deleted = [d for d in Version.objects.get_deleted(related_model) if d.revision == old_revision]
+            deleted = list(self.get_deleted(related_model, old_revision.id))
 
         return versions, missing_objects_dict, deleted
+
+    def get_deleted(self, model, revision_id):
+        model_db = router.db_for_write(model)
+        db = Version.objects.db
+        connection = connections[db]
+        if db == model_db and connection.vendor in ('sqlite', 'postgresql', 'oracle'):
+            content_type = _get_content_type(model, db)
+            subquery = SubquerySQL(
+                """
+                SELECT MAX(V.{id})
+                FROM {version} V
+                LEFT JOIN {model} ON V.{object_id} = CAST({model}.{model_id} as {str})
+                WHERE
+                    V.{db} = %s AND
+                    V.{content_type_id} = %s AND
+                    {model}.{model_id} IS NULL AND 
+                    V.{revision_id} = %s
+                GROUP BY V.{object_id}
+                """.format(
+                    id=connection.ops.quote_name("id"),
+                    version=connection.ops.quote_name(Version._meta.db_table),
+                    model=connection.ops.quote_name(model._meta.db_table),
+                    model_id=connection.ops.quote_name(model._meta.pk.db_column or model._meta.pk.attname),
+                    object_id=connection.ops.quote_name("object_id"),
+                    str=Version._meta.get_field("object_id").db_type(connection),
+                    db=connection.ops.quote_name("db"),
+                    content_type_id=connection.ops.quote_name("content_type_id"),
+                    revision_id=connection.ops.quote_name("revision_id"),
+                ),
+                (model_db, content_type.id, revision_id),
+                output_field=Version._meta.pk,
+            )
+            return Version.objects.filter(pk__in=subquery)
+        else:
+            return Version.objects.get_deleted(model).filter(revision_id=revision_id)
 
     def get_debug(self):  # pragma: no cover
         if not settings.DEBUG:
